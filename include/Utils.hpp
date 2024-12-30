@@ -20,6 +20,8 @@ public:
     // Timestamp utilities
     static uint64_t getCurrentTimestamp();
     static bool validateTimestamp(uint64_t timestamp);
+
+    static std::vector<uint8_t> computeHash(const std::vector<uint8_t>& data);
     
 private:
     static constexpr size_t NONCE_SIZE = 32; // 256 bits

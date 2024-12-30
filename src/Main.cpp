@@ -22,6 +22,22 @@ namespace {
         shutdownRequested = true;
     }
 
+    struct AckMessage {
+        std::vector<uint8_t> messageHash;
+        uint64_t timestamp;
+        MessageStatus status;
+
+        std::vector<uint8_t> serialize() const {
+            // Basic serialization - you may want to implement a more robust version
+            std::vector<uint8_t> result;
+            result.insert(result.end(), messageHash.begin(), messageHash.end());
+            result.insert(result.end(), reinterpret_cast<const uint8_t*>(&timestamp),
+                         reinterpret_cast<const uint8_t*>(&timestamp) + sizeof(timestamp));
+            result.push_back(static_cast<uint8_t>(status));
+            return result;
+        }
+    };
+
     void handleSecureMessage(const std::vector<uint8_t>& message) {
         try {
             if (message.empty()) {
@@ -37,8 +53,14 @@ namespace {
             }
             
             // Send acknowledgment
+            AckMessage ack{
+                .messageHash = Utils::computeHash(message),  // Hash of original message
+                .timestamp = Utils::getCurrentTimestamp(),
+                .status = MessageStatus::Received
+            };
+
             auto response = Communication::packageMessage(
-                std::vector<uint8_t>(decryptedMsg.begin(), decryptedMsg.end()),
+                ack.serialize(),
                 KeyManagement::getCurrentEphemeralKeyPair().publicKey,
                 Utils::generateNonce(),
                 Utils::getCurrentTimestamp()
@@ -91,6 +113,11 @@ uint16_t validatePort(const char* port_str) {
     }
 }
 
+enum class MessageStatus : uint8_t {
+    Received = 0,
+    Error = 1
+};
+
 int main(int argc, char* argv[]) {
     using namespace secure_comm;
     
@@ -106,15 +133,6 @@ int main(int argc, char* argv[]) {
         
         Logger::logEvent(LogLevel::Info, "Secure Communication System starting...");
         
-        // Initialize systems with proper error handling
-        if (!NetworkStack::initialize()) {
-            throw std::runtime_error("Failed to initialize network stack");
-        }
-        
-        if (!KeyManagement::initialize()) {
-            throw std::runtime_error("Failed to initialize key management");
-        }
-        
         // Parse command line arguments
         bool server_mode = (argc > 1 && std::string(argv[1]) == "--server");
         uint16_t port = (argc > 2) ? validatePort(argv[2]) : 8443;
@@ -122,27 +140,46 @@ int main(int argc, char* argv[]) {
         if (server_mode) {
             Logger::logEvent(LogLevel::Info, "Starting server mode on port " + std::to_string(port));
             
-            if (!NetworkStack::startServer(port, handleSecureMessage)) {
-                throw std::runtime_error("Failed to start server");
+            // Initialize network stack singleton
+            auto& network = NetworkStack::getInstance();
+            
+            // Initialize key management
+            if (!KeyManagement::initialize()) {
+                throw std::runtime_error("Failed to initialize key management");
             }
             
-            // Schedule key renewal with proper interval
-            KeyManagement::scheduleKeyRenewal(std::chrono::hours(1));
-            
-            // Main server loop with proper shutdown handling
+            // Start message handling loop
             while (!shutdownRequested) {
-                std::this_thread::sleep_for(std::chrono::seconds(1));
+                try {
+                    auto message = network.receive();
+                    if (!message.empty()) {
+                        handleSecureMessage(message);
+                    }
+                }
+                catch (const std::exception& e) {
+                    Logger::logError(ErrorCode::ProcessingError,
+                        std::string("Error in message loop: ") + e.what());
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
         } else {
             Logger::logEvent(LogLevel::Info, "Starting client mode");
             
-            // Establish secure session with proper key handling
+            // Initialize network stack singleton
+            auto& network = NetworkStack::getInstance();
+            
+            // Initialize key management
+            if (!KeyManagement::initialize()) {
+                throw std::runtime_error("Failed to initialize key management");
+            }
+            
+            // Establish secure session
             auto clientKeyPair = KeyManagement::getCurrentEphemeralKeyPair();
             if (!KeyManagement::establishSession(clientKeyPair.publicKey)) {
                 throw std::runtime_error("Failed to establish secure session");
             }
             
-            // Send test message with proper validation
+            // Send test message
             std::string message = "Hello, secure server!";
             if (!Communication::sendSecureMessage("localhost:" + std::to_string(port), message)) {
                 throw std::runtime_error("Failed to send secure message");

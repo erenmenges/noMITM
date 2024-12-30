@@ -4,6 +4,7 @@
 #include <openssl/evp.h>
 #include <openssl/bio.h>
 #include <openssl/buffer.h>
+#include <openssl/sha.h>
 
 namespace secure_comm {
 
@@ -129,6 +130,15 @@ bool Utils::validateTimestamp(uint64_t timestamp) {
     auto difference = std::abs(static_cast<int64_t>(now - timestamp));
     
     return difference <= TIMESTAMP_TOLERANCE.count();
+}
+
+std::vector<uint8_t> Utils::computeHash(const std::vector<uint8_t>& data) {
+    std::vector<uint8_t> hash(SHA256_DIGEST_LENGTH);
+    SHA256_CTX sha256;
+    SHA256_Init(&sha256);
+    SHA256_Update(&sha256, data.data(), data.size());
+    SHA256_Final(hash.data(), &sha256);
+    return hash;
 }
 
 } // namespace secure_comm

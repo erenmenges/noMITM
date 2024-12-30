@@ -17,34 +17,40 @@ namespace {
     constexpr size_t MAX_CONNECTIONS = 10;
 }
 
-// Static member initializations
-std::atomic<bool> NetworkStack::running_{false};
-std::atomic<int> NetworkStack::server_socket_{-1};
-std::atomic<int> NetworkStack::client_socket_{-1};
-std::atomic<bool> NetworkStack::is_server_{false};
-std::thread NetworkStack::server_thread_;
-std::map<int, NetworkStack::Message> NetworkStack::incomplete_messages_;
-std::vector<uint8_t> NetworkStack::read_buffer_(INITIAL_BUFFER_SIZE);
-std::function<void(const std::vector<uint8_t>&)> NetworkStack::message_handler_;
-std::mutex NetworkStack::network_mutex_;
-std::mutex NetworkStack::message_mutex_;
+constexpr size_t MAX_BUFFER_SIZE = 1024; // Define MAX_BUFFER_SIZE if not already defined
+
+// Initialize static member variables
+std::atomic<bool> NetworkStack::running_{false};           // Flag indicating if network stack is running
+std::atomic<int> NetworkStack::server_socket_{-1};         // Server socket file descriptor
+std::atomic<int> NetworkStack::client_socket_{-1};         // Client socket file descriptor
+std::atomic<bool> NetworkStack::is_server_{false};         // Flag indicating if instance is server
+std::thread NetworkStack::server_thread_;                  // Thread for handling server operations
+std::map<int, NetworkStack::Message> NetworkStack::incomplete_messages_; // Buffer for partial messages
+std::vector<uint8_t> NetworkStack::read_buffer_(INITIAL_BUFFER_SIZE);   // Buffer for reading data
+std::function<void(const std::vector<uint8_t>&)> NetworkStack::message_handler_; // Callback for message handling
+std::mutex NetworkStack::network_mutex_;                   // Mutex for network operations
+std::mutex NetworkStack::message_mutex_;                   // Mutex for message handling
 
 bool NetworkStack::initialize() {
     try {
+        // Lock network operations during initialization
         std::lock_guard<std::mutex> lock(network_mutex_);
+        
+        // Clear and resize the read buffer if it's not empty
         if (!read_buffer_.empty()) {
             read_buffer_.clear();
         }
         read_buffer_.reserve(INITIAL_BUFFER_SIZE);
         
-        // Initialize OpenSSL
-        SSL_library_init();
-        SSL_load_error_strings();
-        OpenSSL_add_all_algorithms();
+        // Initialize OpenSSL library components
+        SSL_library_init();              // Initialize SSL library
+        SSL_load_error_strings();        // Load SSL error strings
+        OpenSSL_add_all_algorithms();    // Load all available algorithms
         
         return true;
     }
     catch (const std::exception& e) {
+        // Log any initialization errors and cleanup
         Logger::logError(ErrorCode::ProcessingError,
             std::string("Failed to initialize network stack: ") + e.what());
         cleanup();
@@ -53,25 +59,28 @@ bool NetworkStack::initialize() {
 }
 
 bool NetworkStack::setSocketOptions(int socket) {
+    // Validate socket descriptor
     if (socket < 0) return false;
 
-    // Set socket timeout
+    // Create timeout structure for socket operations
     struct timeval tv;
-    tv.tv_sec = SOCKET_TIMEOUT_MS / 1000;
-    tv.tv_usec = (SOCKET_TIMEOUT_MS % 1000) * 1000;
+    tv.tv_sec = SOCKET_TIMEOUT_MS / 1000;        // Convert milliseconds to seconds
+    tv.tv_usec = (SOCKET_TIMEOUT_MS % 1000) * 1000;  // Remaining milliseconds to microseconds
     
+    // Set receive and send timeouts for the socket
     if (setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0 ||
         setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) < 0) {
         return false;
     }
 
-    // Set non-blocking mode
+    // Get current socket flags
     int flags = fcntl(socket, F_GETFL, 0);
+    // Set socket to non-blocking mode while preserving existing flags
     if (flags < 0 || fcntl(socket, F_SETFL, flags | O_NONBLOCK) < 0) {
         return false;
     }
 
-    // Enable TCP keepalive
+    // Enable TCP keepalive to detect dead connections
     int keepalive = 1;
     if (setsockopt(socket, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive)) < 0) {
         return false;
@@ -84,50 +93,59 @@ bool NetworkStack::startServer(uint16_t port,
     std::function<void(const std::vector<uint8_t>&)> messageHandler)
 {
     try {
+        // Ensure thread safety during server initialization
         std::lock_guard<std::mutex> lock(network_mutex_);
         
+        // Check if server is already running
         if (running_.load() || server_socket_.load() >= 0) {
             throw std::runtime_error("Server already running");
         }
 
+        // Create TCP socket
         int server_sock = socket(AF_INET, SOCK_STREAM, 0);
         if (server_sock < 0) {
             throw std::runtime_error("Failed to create server socket");
         }
 
+        // Configure socket options (timeouts, non-blocking, keepalive)
         if (!setSocketOptions(server_sock)) {
             close(server_sock);
             throw std::runtime_error("Failed to set socket options");
         }
 
-        // Enable address reuse
+        // Enable immediate address reuse after server shutdown
         int reuse = 1;
         if (setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
             close(server_sock);
             throw std::runtime_error("Failed to set SO_REUSEADDR");
         }
 
+        // Prepare server address structure
         struct sockaddr_in server_addr;
-        memset(&server_addr, 0, sizeof(server_addr));
-        server_addr.sin_family = AF_INET;
-        server_addr.sin_addr.s_addr = INADDR_ANY;
-        server_addr.sin_port = htons(port);
+        memset(&server_addr, 0, sizeof(server_addr));     // Clear structure
+        server_addr.sin_family = AF_INET;                 // IPv4
+        server_addr.sin_addr.s_addr = INADDR_ANY;         // Listen on all interfaces
+        server_addr.sin_port = htons(port);               // Set port in network byte order
 
+        // Bind socket to address and port
         if (bind(server_sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
             close(server_sock);
             throw std::runtime_error("Failed to bind server socket");
         }
 
+        // Start listening for incoming connections
         if (listen(server_sock, MAX_CONNECTIONS) < 0) {
             close(server_sock);
             throw std::runtime_error("Failed to listen on server socket");
         }
 
-        server_socket_ = server_sock;
-        message_handler_ = messageHandler;
-        is_server_ = true;
-        running_ = true;
+        // Store server configuration
+        server_socket_ = server_sock;           // Save socket descriptor
+        message_handler_ = messageHandler;      // Save message callback
+        is_server_ = true;                     // Mark as server mode
+        running_ = true;                       // Set running flag
 
+        // Start server thread
         server_thread_ = std::thread(&NetworkStack::serverLoop);
         
         Logger::logEvent(LogLevel::Info, "Server started successfully");
@@ -392,6 +410,52 @@ void NetworkStack::cleanup() {
 
 bool NetworkStack::validateMessageSize(size_t size) {
     return size > 0 && size <= MAX_BUFFER_SIZE;
+}
+
+void NetworkStack::startClientReceiveThread() {
+    if (!client_receive_thread_.joinable()) {
+        client_receive_thread_ = std::thread([this]() {
+            std::vector<uint8_t> buffer(INITIAL_BUFFER_SIZE);
+            
+            while (running_) {
+                try {
+                    ssize_t bytes_read = recv(client_socket_.load(), 
+                        buffer.data(), buffer.size(), 0);
+                        
+                    if (bytes_read > 0) {
+                        std::lock_guard<std::mutex> lock(message_mutex_);
+                        auto& message = incomplete_messages_[client_socket_.load()];
+                        message.last_activity = std::chrono::system_clock::now();
+                        
+                        if (!message.header_received) {
+                            if (bytes_read >= sizeof(uint32_t)) {
+                                message.expected_size = *reinterpret_cast<uint32_t*>(buffer.data());
+                                message.header_received = true;
+                                message.data.insert(message.data.end(),
+                                    buffer.begin() + sizeof(uint32_t),
+                                    buffer.begin() + bytes_read);
+                            }
+                        } else {
+                            message.data.insert(message.data.end(),
+                                buffer.begin(), buffer.begin() + bytes_read);
+                        }
+                        
+                        if (message.data.size() >= message.expected_size) {
+                            if (message_handler_) {
+                                message_handler_(message.data);
+                            }
+                            incomplete_messages_.erase(client_socket_.load());
+                        }
+                    }
+                }
+                catch (const std::exception& e) {
+                    Logger::logError(ErrorCode::NetworkError,
+                        std::string("Client receive error: ") + e.what());
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        });
+    }
 }
 
 } // namespace secure_comm 

@@ -36,6 +36,8 @@ private:
     static bool validatePackage(const EncryptedPackage& pkg);
     static bool sendData(std::string_view destination, const std::vector<uint8_t>& data);
     static std::vector<uint8_t> receiveData();
+    static void validateTimestamp(uint64_t timestamp);
+    static void validateMessageSize(size_t size);
 
     // Prevent instantiation
     Communication() = delete;
