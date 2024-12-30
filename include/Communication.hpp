@@ -1,32 +1,47 @@
-#pragma once // Ensures this header is included once
+#pragma once
 
-#include "SecureTypes.hpp" // For EncryptedPackage struct
+#include <string>
+#include <vector>
+#include <string_view>
+#include "SecureTypes.hpp"
 
-namespace secure_comm { // Begin namespace secure_comm
+namespace secure_comm {
 
 class Communication {
 public:
-    // Packages an encrypted message, signature, nonce, and timestamp into an EncryptedPackage struct
+    // Main communication methods
+    static bool sendSecureMessage(std::string_view destination, std::string_view message);
+    static std::string processIncomingMessage(const std::vector<uint8_t>& data);
+    
+    // Key renewal communication
+    static bool sendKeyRenewalRequest(
+        std::string_view destination, 
+        const std::vector<uint8_t>& newPublicKey);
+    static KeyRenewalResponse receiveKeyRenewalResponse();
+
+    // Package handling
     static EncryptedPackage packageMessage(
         const std::vector<uint8_t>& encryptedData,
         const std::vector<uint8_t>& signature,
-        const std::string& nonce,
+        std::string_view nonce,
         uint64_t timestamp);
 
-    // Parses a received EncryptedPackage (in real code, might deserialize from a buffer)
-    static EncryptedPackage parseMessage(const EncryptedPackage& pkg);
+    static EncryptedPackage parseMessage(const std::vector<uint8_t>& data);
 
-    // Placeholder networking function to send raw data
-    static bool sendData(const std::string& destination, const std::vector<uint8_t>& data);
-
-    // Placeholder networking function to receive raw data
+private:
+    static constexpr size_t MAX_MESSAGE_SIZE = 1024 * 1024; // 1MB
+    static constexpr size_t MIN_MESSAGE_SIZE = 64; // Minimum size for header + minimal content
+    
+    static std::vector<uint8_t> serializePackage(const EncryptedPackage& pkg);
+    static bool validatePackage(const EncryptedPackage& pkg);
+    static bool sendData(std::string_view destination, const std::vector<uint8_t>& data);
     static std::vector<uint8_t> receiveData();
 
-    // Sends a key renewal request with a new public key
-    static bool sendKeyRenewalRequest(const std::string& destination, const std::vector<uint8_t>& newPublicKey);
-
-    // Receives a response containing the peer's new public key
-    static std::vector<uint8_t> receiveKeyRenewalResponse();
+    // Prevent instantiation
+    Communication() = delete;
+    ~Communication() = delete;
+    Communication(const Communication&) = delete;
+    Communication& operator=(const Communication&) = delete;
 };
 
 } // namespace secure_comm

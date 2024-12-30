@@ -1,58 +1,134 @@
-#include "Utils.hpp"            // Include the header for function declarations
-#include <random>               // For generating random numbers
-#include <unordered_set>        // For storing used nonces
+#include "Utils.hpp"
+#include "Logger.hpp"
+#include <openssl/rand.h>
+#include <openssl/evp.h>
+#include <openssl/bio.h>
+#include <openssl/buffer.h>
 
-namespace secure_comm { // Begin namespace secure_comm
+namespace secure_comm {
+
+// Static member initializations
+std::shared_mutex Utils::nonce_mutex_;
+std::unordered_map<std::string, std::chrono::system_clock::time_point> Utils::used_nonces_;
 
 namespace {
-    // A static/global in-memory store of used nonces; real code might store this differently
-    std::unordered_set<std::string> g_usedNonces; 
+    // Helper function to encode binary data as base64
+    std::string base64Encode(const std::vector<uint8_t>& data) {
+        BIO* b64 = BIO_new(BIO_f_base64());
+        BIO* bmem = BIO_new(BIO_s_mem());
+        if (!b64 || !bmem) {
+            BIO_free_all(b64);  // Will handle null safely
+            BIO_free_all(bmem); // Will handle null safely
+            throw std::runtime_error("Failed to create BIO objects");
+        }
+        
+        BIO* bio = BIO_push(b64, bmem);
+        if (!bio) {
+            BIO_free_all(b64);
+            BIO_free_all(bmem);
+            throw std::runtime_error("Failed to push BIO objects");
+        }
+        
+        BIO_write(bio, data.data(), data.size());
+        BIO_flush(bio);
+        BUF_MEM* bptr;
+        BIO_get_mem_ptr(bio, &bptr);
+        std::string result(bptr->data, bptr->length);
+        BIO_free_all(bio);
+        return result;
+    }
+    
+    void cleanupExpiredNonces(std::unordered_map<std::string, std::chrono::system_clock::time_point>& nonces) {
+        auto now = std::chrono::system_clock::now();
+        for (auto it = nonces.begin(); it != nonces.end();) {
+            if (now - it->second > Utils::NONCE_EXPIRY_TIME) {
+                it = nonces.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
 }
 
+// Method implementations
 std::string Utils::generateNonce() {
-    // Create a static 64-bit Mersenne Twister engine seeded with a random device
-    static std::mt19937_64 rng{std::random_device{}()};
-    // Create a uniform distribution over the full range of uint64_t
-    static std::uniform_int_distribution<uint64_t> dist;
-
-    // Generate a random 64-bit number
-    auto randomValue = dist(rng);
-    // Convert to string (very simplistic nonce)
-    auto nonce = std::to_string(randomValue);
-    return nonce;
-}
-
-uint64_t Utils::getCurrentTimestamp() {
-    using namespace std::chrono; // Bring chrono types into scope
-    // Get current time from system_clock and convert to a duration since epoch
-    auto now = system_clock::now().time_since_epoch();
-    // Convert duration to seconds (integer)
-    return static_cast<uint64_t>(duration_cast<seconds>(now).count());
+    try {
+        std::vector<uint8_t> random_bytes(NONCE_SIZE);
+        if (RAND_bytes(random_bytes.data(), NONCE_SIZE) != 1) {
+            throw std::runtime_error("Failed to generate random bytes for nonce");
+        }
+        
+        // Encode as base64 to make it URL-safe
+        std::string nonce = base64Encode(random_bytes);
+        
+        // Remove any base64 padding characters
+        while (!nonce.empty() && nonce.back() == '=') {
+            nonce.pop_back();
+        }
+        
+        // Store nonce with current timestamp
+        {
+            std::unique_lock<std::shared_mutex> lock(nonce_mutex_);
+            // Periodically cleanup expired nonces
+            if (used_nonces_.size() > 1000) { // Arbitrary threshold
+                cleanupExpiredNonces(used_nonces_);
+            }
+            used_nonces_[nonce] = std::chrono::system_clock::now();
+        }
+        
+        return nonce;
+    }
+    catch (const std::exception& e) {
+        Logger::logError(ErrorCode::ProcessingError,
+            std::string("Failed to generate nonce: ") + e.what());
+        throw;
+    }
 }
 
 bool Utils::validateNonce(const std::string& nonce) {
-    // Check if this nonce was already used
-    if (g_usedNonces.find(nonce) != g_usedNonces.end()) {
-        return false; // If found, it's invalid
+    try {
+        std::unique_lock<std::shared_mutex> lock(nonce_mutex_);
+        
+        auto now = std::chrono::system_clock::now();
+        bool found = false;
+        bool expired = false;
+        
+        // Constant-time comparison
+        for (const auto& [stored_nonce, timestamp] : used_nonces_) {
+            bool matches = (stored_nonce.length() == nonce.length());
+            size_t len = stored_nonce.length();
+            for (size_t i = 0; i < len; i++) {
+                matches &= (stored_nonce[i] == nonce[i]);
+            }
+            if (matches) {
+                found = true;
+                expired = (now - timestamp > NONCE_EXPIRY_TIME);
+                break;
+            }
+        }
+        
+        if (!found) return false;
+        if (expired) {
+            used_nonces_.erase(nonce);
+            return false;
+        }
+        return true;
     }
-    // Otherwise, record it as used
-    g_usedNonces.insert(nonce);
-    return true; // Valid if not previously used
+    catch (...) {
+        return false;
+    }
+}
+
+uint64_t Utils::getCurrentTimestamp() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
 bool Utils::validateTimestamp(uint64_t timestamp) {
-    // We'll allow a ±5 minute skew
-    const uint64_t ALLOWED_SKEW = 300; // 300 seconds = 5 minutes
-    uint64_t now = getCurrentTimestamp(); // Current time
-
-    // If timestamp is too far in the past
-    if (timestamp + ALLOWED_SKEW < now) 
-        return false;
-    // If timestamp is too far in the future
-    if (timestamp > now + ALLOWED_SKEW) 
-        return false;
-
-    return true; // Otherwise valid
+    auto now = getCurrentTimestamp();
+    auto difference = std::abs(static_cast<int64_t>(now - timestamp));
+    
+    return difference <= TIMESTAMP_TOLERANCE.count();
 }
 
 } // namespace secure_comm

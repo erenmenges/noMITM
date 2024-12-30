@@ -1,50 +1,62 @@
-#pragma once // Ensures single inclusion of this header
+#pragma once
 
-#include <string>       // For std::string
-#include <vector>       // For std::vector
-#include <cstdint>      // For fixed-width integer types
+#include <string>
+#include <vector>
+#include "SecureTypes.hpp"
 
-namespace secure_comm { // Begin namespace secure_comm
+namespace secure_comm {
+
+struct ECDHKeyPair {
+    std::vector<uint8_t> privateKey;
+    std::vector<uint8_t> publicKey;
+    
+    ~ECDHKeyPair() {
+        Crypto::secureWipe(privateKey);
+        Crypto::secureWipe(publicKey);
+    }
+};
 
 class Crypto {
 public:
-    // Represents an ECDH key pair consisting of a private and a public key
-    struct ECDHKeyPair {
-        std::vector<uint8_t> privateKey; // The private key bytes
-        std::vector<uint8_t> publicKey;  // The public key bytes
-    };
-
-    // Generates an ephemeral ECDH key pair for one side of the exchange
+    // Key generation and management
     static ECDHKeyPair generateEphemeralKeyPair();
-
-    // Derives a session key using ECDH given a peer's public key and our private key
     static std::vector<uint8_t> deriveSessionKey(
         const std::vector<uint8_t>& peerPublicKey,
-        const std::vector<uint8_t>& ourPrivateKey);
+        const std::vector<uint8_t>& privateKey);
 
-    // Encrypts plaintext using AES-256
+    // Symmetric encryption (AES-GCM)
     static std::vector<uint8_t> aesEncrypt(
-        const std::string& plaintext,
+        const std::string_view plaintext,
         const std::vector<uint8_t>& key);
-
-    // Decrypts ciphertext (AES-256)
     static std::string aesDecrypt(
         const std::vector<uint8_t>& ciphertext,
         const std::vector<uint8_t>& key);
 
-    // Computes a SHA-256 hash of the input data
-    static std::vector<uint8_t> sha256(const std::string& data);
-
-    // Signs the given hash with ECDSA using a private key
+    // Digital signatures
     static std::vector<uint8_t> ecdsaSign(
         const std::vector<uint8_t>& hash,
         const std::vector<uint8_t>& privateKey);
-
-    // Verifies an ECDSA signature against the hash using a public key
     static bool ecdsaVerify(
         const std::vector<uint8_t>& hash,
         const std::vector<uint8_t>& signature,
         const std::vector<uint8_t>& publicKey);
+
+    // Hashing
+    static std::vector<uint8_t> sha256(const std::string_view data);
+
+    // Secure memory wiping
+    static void secureWipe(std::vector<uint8_t>& data);
+
+private:
+    static constexpr size_t AES_KEY_SIZE = 32;  // 256 bits
+    static constexpr size_t GCM_IV_SIZE = 12;   // 96 bits
+    static constexpr size_t GCM_TAG_SIZE = 16;  // 128 bits
+    
+    // Prevent instantiation
+    Crypto() = delete;
+    ~Crypto() = delete;
+    Crypto(const Crypto&) = delete;
+    Crypto& operator=(const Crypto&) = delete;
 };
 
 } // namespace secure_comm

@@ -6,18 +6,21 @@
 
 namespace secure_comm { // Begin namespace secure_comm to group related functionality
 
-// Enumerates possible error codes that can occur in the secure communication library
+// Error codes for the secure communication library
 enum class ErrorCode {
-    None = 0,                          // No error occurred
-    CertificateVerificationFailed,     // Certificate failed verification
-    CertificateRevoked,               // Certificate is revoked (OCSP check failed)
-    InvalidNonce,                      // Nonce is invalid or has been used before
-    InvalidTimestamp,                  // Timestamp is outside the acceptable range
-    InvalidSignature,                  // Signature verification failed
-    KeyRenewalFailed,                  // Failed to renew session key
-    DecryptionFailed,                  // An error occurred during decryption
-    ProcessingError,                   // A general processing error occurred
-    // ... more as needed
+    None = 0,
+    CertificateVerificationFailed,
+    CertificateRevoked,
+    InvalidNonce,
+    InvalidTimestamp,
+    InvalidSignature,
+    KeyRenewalFailed,
+    DecryptionFailed,
+    ProcessingError,
+    NetworkError,
+    SecurityError,
+    InvalidParameter,
+    ResourceError
 };
 
 // Converts an ErrorCode to a human-readable string
@@ -41,17 +44,66 @@ inline const char* toString(ErrorCode code) {
             return "Decryption Failed"; // If an error occurs during AES decrypt
         case ErrorCode::ProcessingError: 
             return "Processing Error"; // If a general error happened in processing
+        case ErrorCode::NetworkError: 
+            return "Network Error"; // If a network error occurred
+        case ErrorCode::SecurityError: 
+            return "Security Error"; // If a security error occurred
+        case ErrorCode::InvalidParameter: 
+            return "Invalid Parameter"; // If an invalid parameter was provided
+        case ErrorCode::ResourceError: 
+            return "Resource Error"; // If a resource error occurred
         default: 
             return "Unknown error"; // Catch-all for unhandled error codes
     }
 }
 
-// A struct representing an encrypted package that includes the ciphertext, signature, etc.
+// Structure for key pairs
+struct KeyPair {
+    std::vector<uint8_t> privateKey;
+    std::vector<uint8_t> publicKey;
+};
+
+// Structure for encrypted messages
 struct EncryptedPackage {
-    std::vector<uint8_t> encryptedData;  // The AES-encrypted message data
-    std::vector<uint8_t> signature;      // ECDSA signature bytes
-    std::string nonce;                   // A unique nonce for replay protection
-    uint64_t timestamp;                  // Timestamp to check message freshness
+    std::vector<uint8_t> encryptedData;
+    std::vector<uint8_t> signature;
+    std::string nonce;
+    uint64_t timestamp;
+};
+
+// Structure for session information
+struct SessionInfo {
+    std::vector<uint8_t> sessionKey;
+    uint64_t establishedAt;
+    uint64_t expiresAt;
+    bool isValid;
+};
+
+// Constants for security parameters
+struct SecurityParameters {
+    static constexpr size_t MIN_KEY_SIZE = 256;
+    static constexpr size_t MAX_MESSAGE_SIZE = 1024 * 1024; // 1MB
+    static constexpr uint32_t MAX_SESSION_DURATION = 3600;  // 1 hour
+    static constexpr uint32_t NONCE_TIMEOUT = 300;         // 5 minutes
+    static constexpr uint32_t TIMESTAMP_TOLERANCE = 300;    // 5 minutes
+};
+
+// Message types for protocol communication
+enum class MessageType : uint8_t {
+    Data = 0,
+    KeyRenewal = 1,
+    SessionEstablishment = 2,
+    Error = 3,
+    Heartbeat = 4,
+    Acknowledgment = 5
+};
+
+struct KeyRenewalResponse {
+    bool success;
+    std::vector<uint8_t> peerPublicKey;
+    std::vector<uint8_t> signature;
+    std::string nonce;
+    uint64_t timestamp;
 };
 
 } // namespace secure_comm

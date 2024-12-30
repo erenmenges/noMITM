@@ -1,21 +1,32 @@
-#pragma once // Ensures this header is only included once
+#pragma once
 
-#include <string>   // For std::string
-#include <chrono>   // For time utilities
-#include <cstdint>  // For fixed-width integer types
+#include <string>
+#include <vector>
+#include <chrono>
+#include <cstdint>
+#include <unordered_map>
+#include <shared_mutex>
 
-namespace secure_comm { // Begin namespace secure_comm
+namespace secure_comm {
 
 class Utils {
 public:
-    static std::string generateNonce();          // Generates a random nonce as a string
-    static uint64_t getCurrentTimestamp();       // Retrieves the current Unix timestamp in seconds
-
-    // Validates that the provided nonce is unique/not used before
+    static constexpr auto NONCE_EXPIRY_TIME = std::chrono::hours(24);
+    
+    // Nonce management
+    static std::string generateNonce();
     static bool validateNonce(const std::string& nonce);
-
-    // Validates that the provided timestamp is within an acceptable time window
+    
+    // Timestamp utilities
+    static uint64_t getCurrentTimestamp();
     static bool validateTimestamp(uint64_t timestamp);
+    
+private:
+    static constexpr size_t NONCE_SIZE = 32; // 256 bits
+    static constexpr std::chrono::seconds TIMESTAMP_TOLERANCE{300}; // 5 minutes
+    
+    static std::shared_mutex nonce_mutex_;
+    static std::unordered_map<std::string, std::chrono::system_clock::time_point> used_nonces_;
 };
 
 } // namespace secure_comm

@@ -4,216 +4,394 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
-#include <netdb.h>
-#include <thread>
-#include <cstring>
+#include <fcntl.h>
+#include <poll.h>
+#include <errno.h>
+#include <string.h>
+#include <openssl/ssl.h>
 
 namespace secure_comm {
 
-// Initialize static members
-int NetworkStack::server_socket_ = -1;
-int NetworkStack::client_socket_ = -1;
-bool NetworkStack::is_server_ = false;
-bool NetworkStack::running_ = false;
-std::vector<uint8_t> NetworkStack::read_buffer_(1024); // 1KB buffer
-
-void NetworkStack::initialize() {
-    // Nothing specific needed for initialization with raw sockets
-    Logger::logEvent(LogLevel::Info, "Network stack initialized");
+namespace {
+    constexpr int POLL_TIMEOUT = 1000; // 1 second timeout for poll
+    constexpr size_t MAX_CONNECTIONS = 10;
 }
 
-void NetworkStack::cleanup() {
-    if (client_socket_ != -1) {
-        close(client_socket_);
-        client_socket_ = -1;
-    }
-    if (server_socket_ != -1) {
-        close(server_socket_);
-        server_socket_ = -1;
-    }
-    running_ = false;
-    Logger::logEvent(LogLevel::Info, "Network stack cleaned up");
-}
+// Static member initializations
+std::atomic<bool> NetworkStack::running_{false};
+std::atomic<int> NetworkStack::server_socket_{-1};
+std::atomic<int> NetworkStack::client_socket_{-1};
+std::atomic<bool> NetworkStack::is_server_{false};
+std::thread NetworkStack::server_thread_;
+std::map<int, NetworkStack::Message> NetworkStack::incomplete_messages_;
+std::vector<uint8_t> NetworkStack::read_buffer_(INITIAL_BUFFER_SIZE);
+std::function<void(const std::vector<uint8_t>&)> NetworkStack::message_handler_;
+std::mutex NetworkStack::network_mutex_;
+std::mutex NetworkStack::message_mutex_;
 
-void NetworkStack::startServer(uint16_t port, 
-    std::function<void(const std::vector<uint8_t>&)> messageHandler) {
-    
+bool NetworkStack::initialize() {
     try {
-        is_server_ = true;
-        running_ = true;
+        std::lock_guard<std::mutex> lock(network_mutex_);
+        if (!read_buffer_.empty()) {
+            read_buffer_.clear();
+        }
+        read_buffer_.reserve(INITIAL_BUFFER_SIZE);
+        
+        // Initialize OpenSSL
+        SSL_library_init();
+        SSL_load_error_strings();
+        OpenSSL_add_all_algorithms();
+        
+        return true;
+    }
+    catch (const std::exception& e) {
+        Logger::logError(ErrorCode::ProcessingError,
+            std::string("Failed to initialize network stack: ") + e.what());
+        cleanup();
+        return false;
+    }
+}
 
-        // Create socket
-        server_socket_ = socket(AF_INET, SOCK_STREAM, 0);
-        if (server_socket_ == -1) {
-            throw std::runtime_error("Failed to create socket");
+bool NetworkStack::setSocketOptions(int socket) {
+    if (socket < 0) return false;
+
+    // Set socket timeout
+    struct timeval tv;
+    tv.tv_sec = SOCKET_TIMEOUT_MS / 1000;
+    tv.tv_usec = (SOCKET_TIMEOUT_MS % 1000) * 1000;
+    
+    if (setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0 ||
+        setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) < 0) {
+        return false;
+    }
+
+    // Set non-blocking mode
+    int flags = fcntl(socket, F_GETFL, 0);
+    if (flags < 0 || fcntl(socket, F_SETFL, flags | O_NONBLOCK) < 0) {
+        return false;
+    }
+
+    // Enable TCP keepalive
+    int keepalive = 1;
+    if (setsockopt(socket, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive)) < 0) {
+        return false;
+    }
+
+    return true;
+}
+
+bool NetworkStack::startServer(uint16_t port,
+    std::function<void(const std::vector<uint8_t>&)> messageHandler)
+{
+    try {
+        std::lock_guard<std::mutex> lock(network_mutex_);
+        
+        if (running_.load() || server_socket_.load() >= 0) {
+            throw std::runtime_error("Server already running");
         }
 
-        // Set socket options
-        int opt = 1;
-        if (setsockopt(server_socket_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        int server_sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (server_sock < 0) {
+            throw std::runtime_error("Failed to create server socket");
+        }
+
+        if (!setSocketOptions(server_sock)) {
+            close(server_sock);
             throw std::runtime_error("Failed to set socket options");
         }
 
-        // Bind socket
-        struct sockaddr_in address;
-        address.sin_family = AF_INET;
-        address.sin_addr.s_addr = INADDR_ANY;
-        address.sin_port = htons(port);
-
-        if (bind(server_socket_, (struct sockaddr*)&address, sizeof(address)) < 0) {
-            throw std::runtime_error("Failed to bind socket");
+        // Enable address reuse
+        int reuse = 1;
+        if (setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
+            close(server_sock);
+            throw std::runtime_error("Failed to set SO_REUSEADDR");
         }
 
-        // Listen for connections
-        if (listen(server_socket_, 3) < 0) {
-            throw std::runtime_error("Failed to listen");
+        struct sockaddr_in server_addr;
+        memset(&server_addr, 0, sizeof(server_addr));
+        server_addr.sin_family = AF_INET;
+        server_addr.sin_addr.s_addr = INADDR_ANY;
+        server_addr.sin_port = htons(port);
+
+        if (bind(server_sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+            close(server_sock);
+            throw std::runtime_error("Failed to bind server socket");
         }
 
-        // Start accepting connections in a separate thread
-        std::thread([this, messageHandler]() {
-            while (running_) {
+        if (listen(server_sock, MAX_CONNECTIONS) < 0) {
+            close(server_sock);
+            throw std::runtime_error("Failed to listen on server socket");
+        }
+
+        server_socket_ = server_sock;
+        message_handler_ = messageHandler;
+        is_server_ = true;
+        running_ = true;
+
+        server_thread_ = std::thread(&NetworkStack::serverLoop);
+        
+        Logger::logEvent(LogLevel::Info, "Server started successfully");
+        return true;
+
+    } catch (const std::exception& e) {
+        Logger::logError(ErrorCode::ProcessingError,
+            std::string("Failed to start server: ") + e.what());
+        return false;
+    }
+}
+
+void NetworkStack::serverLoop() {
+    try {
+        while (running_) {
+            std::vector<pollfd> poll_fds;
+            
+            {
+                std::lock_guard<std::mutex> lock(network_mutex_);
+                poll_fds.push_back({server_socket_.load(), POLLIN, 0});
+                
+                for (const auto& [client_fd, _] : incomplete_messages_) {
+                    poll_fds.push_back({client_fd, POLLIN, 0});
+                }
+            }
+
+            int poll_result = poll(poll_fds.data(), poll_fds.size(), POLL_TIMEOUT);
+            if (poll_result < 0) {
+                if (errno != EINTR) {
+                    throw std::runtime_error("Poll failed: " + std::string(strerror(errno)));
+                }
+                continue;
+            }
+
+            // Handle new connections
+            if (poll_fds[0].revents & POLLIN) {
                 struct sockaddr_in client_addr;
                 socklen_t addr_len = sizeof(client_addr);
                 
-                int new_socket = accept(server_socket_, 
+                int client_sock = accept(server_socket_.load(), 
                     (struct sockaddr*)&client_addr, &addr_len);
                 
-                if (new_socket >= 0) {
-                    // Handle client in a new thread
-                    std::thread(&NetworkStack::handleClient, 
-                        new_socket, messageHandler).detach();
+                if (client_sock >= 0) {
+                    if (!setSocketOptions(client_sock)) {
+                        close(client_sock);
+                        Logger::logEvent(LogLevel::Warning, 
+                            "Failed to set options for client socket");
+                        continue;
+                    }
+
+                    std::lock_guard<std::mutex> lock(message_mutex_);
+                    incomplete_messages_[client_sock] = Message();
+                    Logger::logEvent(LogLevel::Info, "New client connected");
                 }
             }
-        }).detach();
 
-        Logger::logEvent(LogLevel::Info, "Server started on port " + std::to_string(port));
+            // Handle client data
+            for (size_t i = 1; i < poll_fds.size(); ++i) {
+                if (poll_fds[i].revents & (POLLIN | POLLHUP)) {
+                    handleClient(poll_fds[i].fd, message_handler_);
+                }
+            }
+
+            cleanupInactiveConnections();
+        }
     }
     catch (const std::exception& e) {
-        Logger::logEvent(LogLevel::Error, "Server error: " + std::string(e.what()));
-        running_ = false;
-        cleanup();
+        Logger::logError(ErrorCode::ProcessingError,
+            std::string("Server loop failed: ") + e.what());
     }
 }
 
 void NetworkStack::handleClient(int client_socket, 
-    std::function<void(const std::vector<uint8_t>&)> messageHandler) {
-    
-    std::vector<uint8_t> buffer(1024);
-    
-    while (running_) {
-        ssize_t bytes_read = recv(client_socket, buffer.data(), buffer.size(), 0);
-        
-        if (bytes_read > 0) {
-            std::vector<uint8_t> received_data(buffer.begin(), 
-                buffer.begin() + bytes_read);
-            messageHandler(received_data);
-        }
-        else if (bytes_read <= 0) {
-            break; // Connection closed or error
-        }
-    }
-    
-    close(client_socket);
-}
-
-void NetworkStack::stopServer() {
-    if (is_server_ && running_) {
-        cleanup();
-        Logger::logEvent(LogLevel::Info, "Server stopped");
-    }
-}
-
-bool NetworkStack::connect(const std::string& host, uint16_t port) {
+    std::function<void(const std::vector<uint8_t>&)> messageHandler)
+{
     try {
-        // Create socket
-        client_socket_ = socket(AF_INET, SOCK_STREAM, 0);
-        if (client_socket_ == -1) {
-            throw std::runtime_error("Failed to create socket");
+        std::vector<uint8_t> buffer(INITIAL_BUFFER_SIZE);
+        ssize_t bytes_read = recv(client_socket, buffer.data(), buffer.size(), 0);
+
+        if (bytes_read <= 0) {
+            if (bytes_read == 0 || errno != EAGAIN) {
+                cleanupSocket(client_socket);
+            }
+            return;
         }
 
-        // Resolve hostname
-        struct hostent* server = gethostbyname(host.c_str());
-        if (server == nullptr) {
-            throw std::runtime_error("Failed to resolve hostname");
+        std::lock_guard<std::mutex> lock(message_mutex_);
+        auto& message = incomplete_messages_[client_socket];
+        message.last_activity = std::chrono::system_clock::now();
+
+        if (!message.header_received) {
+            if (bytes_read < sizeof(uint32_t)) {
+                return;
+            }
+
+            message.expected_size = *reinterpret_cast<uint32_t*>(buffer.data());
+            if (!validateMessageSize(message.expected_size)) {
+                cleanupSocket(client_socket);
+                return;
+            }
+
+            message.header_received = true;
+            message.data.reserve(message.expected_size);
+            message.data.insert(message.data.end(), 
+                buffer.begin() + sizeof(uint32_t),
+                buffer.begin() + bytes_read);
+        } else {
+            message.data.insert(message.data.end(), 
+                buffer.begin(), 
+                buffer.begin() + bytes_read);
         }
 
-        // Prepare the sockaddr_in structure
+        if (message.data.size() >= message.expected_size) {
+            messageHandler(message.data);
+            incomplete_messages_.erase(client_socket);
+        }
+    }
+    catch (const std::exception& e) {
+        Logger::logError(ErrorCode::ProcessingError,
+            std::string("Failed to handle client: ") + e.what());
+        cleanupSocket(client_socket);
+    }
+}
+
+bool NetworkStack::connect(std::string_view host, uint16_t port) {
+    try {
+        std::lock_guard<std::mutex> lock(network_mutex_);
+        
+        if (client_socket_.load() >= 0) {
+            throw std::runtime_error("Already connected");
+        }
+
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) {
+            throw std::runtime_error("Failed to create client socket");
+        }
+
+        if (!setSocketOptions(sock)) {
+            close(sock);
+            throw std::runtime_error("Failed to set socket options");
+        }
+
         struct sockaddr_in server_addr;
+        memset(&server_addr, 0, sizeof(server_addr));
         server_addr.sin_family = AF_INET;
-        memcpy(&server_addr.sin_addr.s_addr, server->h_addr, server->h_length);
         server_addr.sin_port = htons(port);
 
-        // Connect to server
-        if (::connect(client_socket_, (struct sockaddr*)&server_addr, 
-            sizeof(server_addr)) < 0) {
+        if (inet_pton(AF_INET, host.data(), &server_addr.sin_addr) <= 0) {
+            close(sock);
+            throw std::runtime_error("Invalid address");
+        }
+
+        if (::connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+            close(sock);
             throw std::runtime_error("Connection failed");
         }
 
-        Logger::logEvent(LogLevel::Info, 
-            "Connected to " + host + ":" + std::to_string(port));
+        client_socket_ = sock;
+        running_ = true;
+        Logger::logEvent(LogLevel::Info, "Connected to server successfully");
         return true;
     }
     catch (const std::exception& e) {
-        Logger::logEvent(LogLevel::Error, 
-            "Connection error: " + std::string(e.what()));
-        cleanup();
+        Logger::logError(ErrorCode::ProcessingError,
+            std::string("Failed to connect: ") + e.what());
         return false;
-    }
-}
-
-void NetworkStack::disconnect() {
-    if (client_socket_ != -1) {
-        close(client_socket_);
-        client_socket_ = -1;
-        Logger::logEvent(LogLevel::Info, "Disconnected from remote host");
     }
 }
 
 bool NetworkStack::sendData(const std::vector<uint8_t>& data) {
-    if (client_socket_ == -1) {
-        Logger::logEvent(LogLevel::Error, "Cannot send data: Not connected");
-        return false;
-    }
-
     try {
-        ssize_t bytes_sent = send(client_socket_, data.data(), data.size(), 0);
-        if (bytes_sent < 0) {
-            throw std::runtime_error("Send failed");
+        if (!validateMessageSize(data.size())) {
+            throw std::runtime_error("Invalid message size");
         }
-        Logger::logEvent(LogLevel::Info, 
-            "Sent " + std::to_string(bytes_sent) + " bytes");
+
+        std::lock_guard<std::mutex> lock(network_mutex_);
+        int socket = is_server_ ? server_socket_.load() : client_socket_.load();
+        
+        if (socket < 0) {
+            throw std::runtime_error("Not connected");
+        }
+
+        // Send size header
+        uint32_t size = static_cast<uint32_t>(data.size());
+        if (send(socket, &size, sizeof(size), 0) != sizeof(size)) {
+            throw std::runtime_error("Failed to send message size");
+        }
+
+        // Send data
+        size_t total_sent = 0;
+        while (total_sent < data.size()) {
+            ssize_t sent = send(socket, 
+                data.data() + total_sent, 
+                data.size() - total_sent, 
+                0);
+            
+            if (sent <= 0) {
+                if (errno != EAGAIN) {
+                    throw std::runtime_error("Send failed");
+                }
+                continue;
+            }
+            
+            total_sent += sent;
+        }
+
         return true;
     }
     catch (const std::exception& e) {
-        Logger::logEvent(LogLevel::Error, 
-            "Send error: " + std::string(e.what()));
+        Logger::logError(ErrorCode::ProcessingError,
+            std::string("Failed to send data: ") + e.what());
         return false;
     }
 }
 
-std::vector<uint8_t> NetworkStack::receiveData() {
-    if (client_socket_ == -1) {
-        Logger::logEvent(LogLevel::Error, "Cannot receive data: Not connected");
-        return {};
+void NetworkStack::cleanupSocket(int socket) {
+    if (socket >= 0) {
+        close(socket);
+    }
+}
+
+void NetworkStack::cleanupInactiveConnections() {
+    std::lock_guard<std::mutex> lock(message_mutex_);
+    auto now = std::chrono::system_clock::now();
+    
+    for (auto it = incomplete_messages_.begin(); it != incomplete_messages_.end();) {
+        auto duration = std::chrono::duration_cast<std::chrono::seconds>(
+            now - it->second.last_activity).count();
+            
+        if (duration > SOCKET_TIMEOUT_MS / 1000) {
+            cleanupSocket(it->first);
+            it = incomplete_messages_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void NetworkStack::cleanup() {
+    running_ = false;
+    
+    if (server_thread_.joinable()) {
+        server_thread_.join();
     }
 
-    try {
-        ssize_t bytes_received = recv(client_socket_, 
-            read_buffer_.data(), read_buffer_.size(), 0);
-        
-        if (bytes_received > 0) {
-            Logger::logEvent(LogLevel::Info, 
-                "Received " + std::to_string(bytes_received) + " bytes");
-            return std::vector<uint8_t>(read_buffer_.begin(), 
-                read_buffer_.begin() + bytes_received);
+    std::lock_guard<std::mutex> lock(network_mutex_);
+    
+    cleanupSocket(server_socket_);
+    cleanupSocket(client_socket_);
+    
+    {
+        std::lock_guard<std::mutex> msg_lock(message_mutex_);
+        for (auto& [socket, _] : incomplete_messages_) {
+            cleanupSocket(socket);
         }
-        return {};
+        incomplete_messages_.clear();
     }
-    catch (const std::exception& e) {
-        Logger::logEvent(LogLevel::Error, 
-            "Receive error: " + std::string(e.what()));
-        return {};
-    }
+    
+    is_server_ = false;
+    Logger::logEvent(LogLevel::Info, "Network stack cleaned up successfully");
+}
+
+bool NetworkStack::validateMessageSize(size_t size) {
+    return size > 0 && size <= MAX_BUFFER_SIZE;
 }
 
 } // namespace secure_comm 

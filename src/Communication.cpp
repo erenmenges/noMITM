@@ -1,67 +1,204 @@
-#include "Communication.hpp" // Include the declaration of Communication
-#include "Logger.hpp"        // For logging
+#include "Communication.hpp"
+#include "Logger.hpp"
 #include "NetworkStack.hpp"
+#include "KeyManagement.hpp"
+#include "Utils.hpp"
+#include "Protocol.hpp"
+#include <sstream>
+#include "Crypto.hpp"
+#include <stdexcept>
 
-namespace secure_comm { // Begin namespace secure_comm
+namespace secure_comm {
 
-EncryptedPackage Communication::packageMessage(
-    const std::vector<uint8_t>& encryptedData,
-    const std::vector<uint8_t>& signature,
-    const std::string& nonce,
-    uint64_t timestamp)
+namespace {
+    // Move constants to anonymous namespace or make them public in class
+    constexpr size_t MIN_MESSAGE_SIZE = 64;
+    constexpr size_t MAX_MESSAGE_SIZE = 1024 * 1024;
+
+    // Helper function to validate input size
+    void validateMessageSize(size_t size) {
+        if (size < MIN_MESSAGE_SIZE || 
+            size > MAX_MESSAGE_SIZE) {
+            throw std::invalid_argument("Invalid message size");
+        }
+    }
+
+    // Helper function to validate timestamp
+    void validateTimestamp(uint64_t timestamp) {
+        if (!Utils::validateTimestamp(timestamp)) {
+            throw std::invalid_argument("Invalid timestamp");
+        }
+    }
+
+    void validateSize(size_t size) {
+        if (size > MAX_MESSAGE_SIZE) {
+            throw std::runtime_error("Message size exceeds maximum allowed");
+        }
+    }
+}
+
+bool Communication::sendSecureMessage(
+    std::string_view destination, 
+    std::string_view message) 
 {
-    EncryptedPackage pkg;         // Create a new EncryptedPackage
-    pkg.encryptedData = encryptedData; // Assign ciphertext
-    pkg.signature = signature;         // Assign signature
-    pkg.nonce = nonce;                // Assign nonce
-    pkg.timestamp = timestamp;        // Assign timestamp
-    return pkg;                       // Return the populated structure
-}
+    try {
+        validateMessageSize(message.size());
 
-EncryptedPackage Communication::parseMessage(const EncryptedPackage& pkg) {
-    // In real code, you'd parse a serialized buffer. Here, we just return what was passed in.
-    return pkg;
-}
+        // Get current keys
+        auto currentKeyPair = KeyManagement::getCurrentEphemeralKeyPair();
+        auto sessionKey = KeyManagement::getCurrentSessionKey();
+        
+        if (sessionKey.empty() || currentKeyPair.privateKey.empty()) {
+            throw std::runtime_error("Invalid key state");
+        }
 
-bool Communication::sendData(const std::string& destination, const std::vector<uint8_t>& data) {
-    // Parse destination string (expected format: "host:port")
-    size_t colonPos = destination.find(':');
-    if (colonPos == std::string::npos) {
-        Logger::logError(ErrorCode::ProcessingError, "Invalid destination format");
+        // Generate nonce and timestamp
+        std::string nonce = Utils::generateNonce();
+        uint64_t timestamp = Utils::getCurrentTimestamp();
+        
+        // Encrypt message
+        std::vector<uint8_t> ciphertext = Crypto::aesEncrypt(message, sessionKey);
+        
+        // Create message hash with all components
+        std::vector<uint8_t> messageData;
+        messageData.reserve(ciphertext.size() + nonce.size() + sizeof(timestamp));
+        messageData.insert(messageData.end(), ciphertext.begin(), ciphertext.end());
+        messageData.insert(messageData.end(), nonce.begin(), nonce.end());
+        
+        const uint8_t* timestampBytes = reinterpret_cast<const uint8_t*>(&timestamp);
+        messageData.insert(messageData.end(), 
+            timestampBytes, 
+            timestampBytes + sizeof(timestamp));
+        
+        auto hash = Crypto::sha256({
+            reinterpret_cast<const char*>(messageData.data()), 
+            messageData.size()
+        });
+        
+        // Sign the hash
+        auto signature = Crypto::ecdsaSign(hash, currentKeyPair.privateKey);
+        
+        // Package everything together
+        EncryptedPackage pkg;
+        pkg.encryptedData = std::move(ciphertext);
+        pkg.signature = std::move(signature);
+        pkg.nonce = std::move(nonce);
+        pkg.timestamp = timestamp;
+        
+        if (!validatePackage(pkg)) {
+            throw std::runtime_error("Package validation failed");
+        }
+        
+        // Serialize and send
+        auto serialized = serializePackage(pkg);
+        validateMessageSize(serialized.size());
+        
+        if (!sendData(destination, serialized)) {
+            throw std::runtime_error("Failed to send data");
+        }
+        
+        Logger::logEvent(LogLevel::Info, "Secure message sent successfully");
+        return true;
+    }
+    catch (const std::exception& e) {
+        Logger::logError(ErrorCode::ProcessingError,
+            std::string("Failed to send secure message: ") + e.what());
         return false;
     }
+}
 
-    std::string host = destination.substr(0, colonPos);
-    uint16_t port = std::stoi(destination.substr(colonPos + 1));
-
-    // Connect to the destination
-    if (!NetworkStack::connect(host, port)) {
-        return false;
+std::string Communication::processIncomingMessage(const std::vector<uint8_t>& data) {
+    try {
+        validateMessageSize(data.size());
+        
+        // Parse the incoming package
+        auto pkg = parseMessage(data);
+        
+        if (!validatePackage(pkg)) {
+            throw std::runtime_error("Invalid package");
+        }
+        
+        // Validate timestamp
+        validateTimestamp(pkg.timestamp);
+        
+        // Validate nonce
+        if (!Utils::validateNonce(pkg.nonce)) {
+            throw std::runtime_error("Invalid or reused nonce");
+        }
+        
+        // Verify signature
+        std::vector<uint8_t> messageData;
+        messageData.reserve(pkg.encryptedData.size() + pkg.nonce.size() + sizeof(pkg.timestamp));
+        messageData.insert(messageData.end(), pkg.encryptedData.begin(), pkg.encryptedData.end());
+        messageData.insert(messageData.end(), pkg.nonce.begin(), pkg.nonce.end());
+        
+        const uint8_t* timestampBytes = reinterpret_cast<const uint8_t*>(&pkg.timestamp);
+        messageData.insert(messageData.end(), 
+            timestampBytes, 
+            timestampBytes + sizeof(pkg.timestamp));
+        
+        auto hash = Crypto::sha256({
+            reinterpret_cast<const char*>(messageData.data()), 
+            messageData.size()
+        });
+        
+        auto peerPublicKey = KeyManagement::getPeerPublicKey();
+        if (!Crypto::ecdsaVerify(hash, pkg.signature, peerPublicKey)) {
+            throw std::runtime_error("Signature verification failed");
+        }
+        
+        // Decrypt the message
+        auto sessionKey = KeyManagement::getCurrentSessionKey();
+        return Crypto::aesDecrypt(pkg.encryptedData, sessionKey);
     }
-
-    // Send the data
-    bool result = NetworkStack::sendData(data);
-
-    // Cleanup
-    NetworkStack::disconnect();
-    return result;
+    catch (const std::exception& e) {
+        Logger::logError(ErrorCode::ProcessingError,
+            std::string("Failed to process incoming message: ") + e.what());
+        throw;
+    }
 }
 
-std::vector<uint8_t> Communication::receiveData() {
-    return NetworkStack::receiveData();
+bool Communication::validatePackage(const EncryptedPackage& pkg) {
+    return !pkg.encryptedData.empty() && 
+           !pkg.signature.empty() && 
+           !pkg.nonce.empty() && 
+           pkg.timestamp != 0;
 }
 
-bool Communication::sendKeyRenewalRequest(const std::string& destination, const std::vector<uint8_t>& newPublicKey) {
-    // In a real application, you'd send a special "renewal request" message with the new public key
-    Logger::logEvent(LogLevel::Info, "Sending key renewal request (demo).");
-    return true; // Stub success
+std::vector<uint8_t> Communication::serializePackage(const EncryptedPackage& pkg) {
+    size_t totalSize = sizeof(uint32_t) * 3 + 
+                      pkg.encryptedData.size() +
+                      pkg.signature.size() +
+                      pkg.nonce.size() +
+                      sizeof(pkg.timestamp);
+                      
+    validateSize(totalSize);
+
+    std::vector<uint8_t> serialized;
+    serialized.reserve(totalSize);
+
+    // Helper lambda to append size and data
+    auto appendWithSize = [&serialized](const auto& data) {
+        uint32_t size = static_cast<uint32_t>(data.size());
+        serialized.insert(serialized.end(),
+            reinterpret_cast<const uint8_t*>(&size),
+            reinterpret_cast<const uint8_t*>(&size) + sizeof(size));
+        serialized.insert(serialized.end(), data.begin(), data.end());
+    };
+
+    // Append all components
+    appendWithSize(pkg.encryptedData);
+    appendWithSize(pkg.signature);
+    appendWithSize(pkg.nonce);
+    
+    // Append timestamp
+    serialized.insert(serialized.end(),
+        reinterpret_cast<const uint8_t*>(&pkg.timestamp),
+        reinterpret_cast<const uint8_t*>(&pkg.timestamp) + sizeof(pkg.timestamp));
+
+    return serialized;
 }
 
-std::vector<uint8_t> Communication::receiveKeyRenewalResponse() {
-    // In a real application, you'd wait for a response from the peer
-    Logger::logEvent(LogLevel::Info, "Receiving key renewal response (demo).");
-    // Return a dummy new public key
-    return { 0x99, 0x88, 0x77, 0x66 };
-}
+// ... implement other methods with similar security patterns ...
 
 } // namespace secure_comm
